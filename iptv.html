@@ -1,0 +1,1391 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>IPTV • Bravia Player</title>
+<!--
+  ============================================================================
+  IPTV.HTML — Single-file Android TV / Sony Bravia IPTV Player
+  ============================================================================
+  Everything (HTML/CSS/JS) lives in this one file, except for two remote
+  resources that are unavoidable for correct behaviour on a Chromium-based
+  Google TV browser:
+    1. The IPTV playlist itself (as requested): https://iptv-org.github.io/iptv/index.m3u
+    2. hls.js (CDN) — Chromium (and therefore the Bravia/Google TV browser
+       and Android WebView) has NO native HLS support via <video>. Only
+       Safari does. Without an MSE-based HLS engine, .m3u8 streams simply
+       will not play on this device. This is the one exception to the
+       "no external libraries" rule, because it is a hard platform
+       limitation rather than a preference. Everything else — UI, state,
+       parsing, remote navigation, storage — is hand-written vanilla JS.
+  ============================================================================
+-->
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.15/dist/hls.min.js"></script>
+<style>
+:root{
+  /* ---- Design tokens ---- */
+  --bg:#0b0d10;
+  --panel:#12151a;
+  --panel-2:#181c22;
+  --card:#1d222a;
+  --card-focus:#2a323f;
+  --line:#242a33;
+  --text:#eef1f5;
+  --text-dim:#8992a1;
+  --accent:#3ddc97;      /* signal green — "on air" */
+  --accent-dim:#2a9d6f;
+  --danger:#ff5d5d;
+  --warn:#ffb020;
+  --focus-ring: 0 0 0 3px rgba(61,220,151,0.35), 0 0 22px rgba(61,220,151,0.35);
+  --radius:14px;
+  --radius-sm:9px;
+  --font: "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+}
+*{box-sizing:border-box; margin:0; padding:0;}
+html,body{
+  width:100%; height:100%; background:var(--bg); color:var(--text);
+  font-family:var(--font); overflow:hidden; user-select:none;
+  -webkit-tap-highlight-color:transparent;
+}
+body.cursor-hidden, body.cursor-hidden *{ cursor:none !important; }
+
+/* ================= LAYOUT ================= */
+#app{ position:relative; width:100vw; height:100vh; display:flex; flex-direction:column; }
+
+#topbar{
+  display:flex; align-items:center; gap:16px;
+  height:64px; min-height:64px; padding:0 20px;
+  background:var(--panel); border-bottom:1px solid var(--line); z-index:20;
+}
+#topbar .brand{ font-size:20px; font-weight:700; letter-spacing:.5px; color:var(--accent); white-space:nowrap;}
+#searchBox{
+  flex:1; display:flex; align-items:center; gap:10px;
+  background:var(--panel-2); border:2px solid var(--line); border-radius:var(--radius-sm);
+  padding:8px 14px; transition:border-color .15s, box-shadow .15s;
+}
+#searchBox.focused{ border-color:var(--accent); box-shadow:var(--focus-ring); }
+#searchBox input{
+  flex:1; background:transparent; border:none; outline:none; color:var(--text);
+  font-size:16px; font-family:var(--font);
+}
+#searchBox input::placeholder{ color:var(--text-dim); }
+.topbar-right{ display:flex; align-items:center; gap:18px; font-size:14px; color:var(--text-dim); white-space:nowrap;}
+.dot{ width:9px; height:9px; border-radius:50%; display:inline-block; margin-right:6px; vertical-align:middle;}
+.dot.online{ background:var(--accent); box-shadow:0 0 8px var(--accent);}
+.dot.offline{ background:var(--danger); box-shadow:0 0 8px var(--danger);}
+#clock{ font-variant-numeric:tabular-nums; font-weight:600; }
+
+#main{ flex:1; display:flex; min-height:0; }
+
+/* -------- LEFT NAV -------- */
+#leftNav{
+  width:230px; min-width:230px; background:var(--panel); border-right:1px solid var(--line);
+  display:flex; flex-direction:column; padding:14px 10px; gap:4px; z-index:15;
+  transition:transform .18s ease;
+}
+.nav-item{
+  display:flex; align-items:center; gap:12px; padding:13px 14px; border-radius:var(--radius-sm);
+  color:var(--text-dim); font-size:16px; font-weight:600; cursor:pointer; outline:none;
+  border:2px solid transparent; transition:background .12s, color .12s, border-color .12s;
+}
+.nav-item .ic{ font-size:19px; width:22px; text-align:center; }
+.nav-item.active{ background:var(--card); color:var(--text); }
+.nav-item.focused{ border-color:var(--accent); box-shadow:var(--focus-ring); color:var(--text); background:var(--card-focus); }
+.nav-sep{ height:1px; background:var(--line); margin:10px 4px; }
+.nav-filters{ margin-top:auto; padding-top:8px; font-size:12px; color:var(--text-dim); }
+.nav-filters select{
+  width:100%; margin-bottom:8px; background:var(--panel-2); color:var(--text); border:1px solid var(--line);
+  border-radius:8px; padding:7px; font-size:13px;
+}
+
+/* -------- CENTER: player + list -------- */
+#centerArea{ flex:1; display:flex; flex-direction:column; min-width:0; }
+
+#playerWrap{
+  position:relative; width:100%; background:#000; flex-shrink:0;
+  height:42vh; min-height:230px;
+  display:flex; align-items:center; justify-content:center;
+  border-bottom:1px solid var(--line);
+}
+#video{ width:100%; height:100%; background:#000; object-fit:contain; }
+#playerOverlay{
+  position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
+  pointer-events:none;
+}
+#bufferSpin{
+  width:56px; height:56px; border-radius:50%;
+  border:5px solid rgba(255,255,255,0.15); border-top-color:var(--accent);
+  animation:spin 0.9s linear infinite; display:none;
+}
+@keyframes spin{ to{ transform:rotate(360deg); } }
+#playerHint{
+  position:absolute; top:12px; right:16px; font-size:12px; color:var(--text-dim);
+  background:rgba(0,0,0,0.45); padding:5px 10px; border-radius:8px;
+}
+#noChannel{
+  position:absolute; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center;
+  gap:10px; color:var(--text-dim); font-size:15px;
+}
+#noChannel .big{ font-size:40px; }
+
+#infoBar{
+  display:flex; align-items:center; gap:18px; padding:10px 18px; background:var(--panel-2);
+  border-bottom:1px solid var(--line); flex-shrink:0; font-size:13px; color:var(--text-dim); flex-wrap:wrap;
+}
+#infoBar .ch-name{ color:var(--text); font-weight:700; font-size:16px; }
+#infoBar .badge{
+  padding:2px 8px; border-radius:6px; background:var(--card); font-size:11px; font-weight:700; letter-spacing:.4px;
+}
+#infoBar .badge.live{ background:var(--accent-dim); color:#04150d; }
+
+/* -------- Category bar (shown on top after Categories is selected) -------- */
+#categoryBar{
+  display:flex; gap:8px; padding:12px 18px; overflow-x:auto; flex-shrink:0;
+  background:var(--panel-2); border-bottom:1px solid var(--line); scrollbar-width:none;
+}
+#categoryBar::-webkit-scrollbar{ display:none; }
+.cat-chip{
+  display:flex; align-items:center; gap:8px; padding:9px 16px; border-radius:999px;
+  background:var(--card); border:2px solid transparent; white-space:nowrap; font-size:14px; font-weight:600;
+  color:var(--text-dim); cursor:pointer; flex-shrink:0; transition:background .12s,border-color .12s,color .12s;
+}
+.cat-chip .n{ font-size:11px; opacity:.75; font-weight:700; }
+.cat-chip.selected{ background:var(--accent-dim); color:#04150d; }
+.cat-chip.focused{ border-color:var(--accent); box-shadow:var(--focus-ring); color:var(--text); }
+.cat-chip.selected.focused{ color:#04150d; }
+
+/* -------- Category grid (Categories landing view) -------- */
+#categoryGrid{
+  flex:1; overflow-y:auto; padding:26px; display:grid;
+  grid-template-columns:repeat(3, 1fr); gap:18px; align-content:start;
+}
+.cat-card{
+  background:var(--card); border:2px solid transparent; border-radius:var(--radius);
+  padding:26px 18px; display:flex; flex-direction:column; align-items:center; gap:10px;
+  cursor:pointer; transition:background .12s,border-color .12s,transform .12s;
+}
+.cat-card .icon{ font-size:38px; }
+.cat-card .label{ font-size:16px; font-weight:700; text-align:center; }
+.cat-card .count{ font-size:12px; color:var(--text-dim); }
+.cat-card.focused{ border-color:var(--accent); box-shadow:var(--focus-ring); background:var(--card-focus); transform:translateY(-2px); }
+
+#listHeader{
+  display:flex; align-items:center; justify-content:space-between; padding:10px 18px 6px;
+  color:var(--text-dim); font-size:13px; flex-shrink:0;
+}
+#listHeader .count{ font-weight:700; color:var(--text); }
+#refreshBtn{
+  background:var(--card); border:2px solid transparent; color:var(--text); border-radius:8px;
+  padding:6px 12px; font-size:13px; cursor:pointer; display:flex; align-items:center; gap:6px;
+}
+#refreshBtn.focused{ border-color:var(--accent); box-shadow:var(--focus-ring); }
+
+#listViewport{ flex:1; overflow-y:auto; padding:6px 12px 20px; min-height:0; scrollbar-width:thin; }
+#listViewport::-webkit-scrollbar{ width:8px; }
+#listViewport::-webkit-scrollbar-thumb{ background:var(--line); border-radius:8px; }
+#listSpacerTop{ width:100%; }
+#listSpacerBottom{ width:100%; }
+
+.chan-card{
+  display:flex; align-items:center; gap:12px; padding:9px 12px; margin:4px 0; border-radius:var(--radius-sm);
+  background:var(--card); border:2px solid transparent; cursor:pointer; transition:background .1s, border-color .1s;
+}
+.chan-card.focused{ border-color:var(--accent); box-shadow:var(--focus-ring); background:var(--card-focus); }
+.chan-card.playing{ background:linear-gradient(90deg, rgba(61,220,151,0.14), var(--card)); }
+.chan-card .logo{
+  width:44px; height:44px; border-radius:8px; background:var(--panel-2); flex-shrink:0;
+  display:flex; align-items:center; justify-content:center; overflow:hidden; font-size:11px; color:var(--text-dim);
+}
+.chan-card .logo img{ width:100%; height:100%; object-fit:contain; }
+.chan-card .meta{ flex:1; min-width:0; }
+.chan-card .meta .name{ font-size:15px; font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.chan-card .meta .sub{ font-size:12px; color:var(--text-dim); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; margin-top:2px;}
+.chan-card .star{ font-size:20px; color:var(--text-dim); flex-shrink:0; padding:4px; }
+.chan-card .star.on{ color:var(--warn); }
+.chan-card .live-tag{ font-size:10px; font-weight:700; color:var(--accent); flex-shrink:0; }
+
+.empty-state{ text-align:center; color:var(--text-dim); padding:60px 20px; font-size:15px; }
+.retry-btn{
+  margin-top:16px; display:inline-block; background:var(--danger); color:#fff; font-weight:700;
+  padding:10px 22px; border-radius:10px; border:2px solid transparent; cursor:pointer;
+}
+.retry-btn.focused{ border-color:#fff; box-shadow:0 0 0 3px rgba(255,93,93,0.4); }
+
+/* -------- Settings panel -------- */
+#settingsPanel{
+  position:absolute; inset:0; background:rgba(6,7,9,0.92); z-index:40; display:none;
+  align-items:center; justify-content:center;
+}
+#settingsPanel.show{ display:flex; }
+.settings-box{
+  width:560px; max-width:92vw; max-height:86vh; overflow-y:auto; background:var(--panel);
+  border:1px solid var(--line); border-radius:16px; padding:26px;
+}
+.settings-box h2{ font-size:20px; margin-bottom:18px; color:var(--accent); }
+.set-row{
+  display:flex; align-items:center; justify-content:space-between; padding:12px 10px; border-radius:10px;
+  margin-bottom:4px; border:2px solid transparent;
+}
+.set-row.focused{ border-color:var(--accent); box-shadow:var(--focus-ring); background:var(--card); }
+.set-row .label{ font-size:15px; }
+.set-row .val{ color:var(--text-dim); font-size:14px; font-weight:600; }
+.set-row .val.action{ color:var(--accent); }
+
+/* Toast */
+#toast{
+  position:fixed; bottom:26px; left:50%; transform:translate(-50%, 20px); background:var(--card);
+  border:1px solid var(--line); padding:12px 22px; border-radius:10px; font-size:14px; opacity:0;
+  transition:opacity .25s, transform .25s; z-index:80; pointer-events:none;
+}
+#toast.show{ opacity:1; transform:translate(-50%, 0); }
+
+#loadingScreen{
+  position:absolute; inset:0; background:var(--bg); z-index:90; display:flex; flex-direction:column;
+  align-items:center; justify-content:center; gap:16px;
+}
+#loadingScreen .logo{ font-size:26px; font-weight:800; color:var(--accent); letter-spacing:1px; }
+#loadingScreen .bar-track{ width:320px; height:8px; background:var(--panel-2); border-radius:6px; overflow:hidden; }
+#loadingScreen .bar-fill{ height:100%; width:0%; background:var(--accent); transition:width .2s; }
+#loadingScreen .status{ font-size:13px; color:var(--text-dim); }
+#loadingScreen.green .bar-fill{ background:var(--accent); }
+#loadingScreen.red .status{ color:var(--danger); }
+
+.hidden{ display:none !important; }
+</style>
+</head>
+<body>
+<div id="app">
+
+  <!-- ===================== TOP BAR ===================== -->
+  <div id="topbar">
+    <div class="brand">📺 IPTV</div>
+    <div id="searchBox" tabindex="-1">
+      <span>🔍</span>
+      <input id="searchInput" type="text" placeholder="Search channel, country, language, category..." tabindex="-1">
+    </div>
+    <div class="topbar-right">
+      <span><span class="dot" id="netDot"></span><span id="netText">Checking…</span></span>
+      <span id="clock">--:--</span>
+    </div>
+  </div>
+
+  <div id="main">
+    <!-- ===================== LEFT NAV ===================== -->
+    <div id="leftNav">
+      <div class="nav-item" data-nav="categories" tabindex="-1"><span class="ic">📂</span><span>Categories</span></div>
+      <div class="nav-item" data-nav="favorites" tabindex="-1"><span class="ic">⭐</span><span>Favorites</span></div>
+      <div class="nav-item" data-nav="recent" tabindex="-1"><span class="ic">🕑</span><span>Recently Played</span></div>
+      <div class="nav-item" data-nav="search" tabindex="-1"><span class="ic">🔍</span><span>Search</span></div>
+      <div class="nav-item" data-nav="settings" tabindex="-1"><span class="ic">⚙️</span><span>Settings</span></div>
+      <div class="nav-sep"></div>
+      <div class="nav-filters">
+        <label>Country</label>
+        <select id="countryFilter"><option value="">All countries</option></select>
+        <label>Language</label>
+        <select id="langFilter"><option value="">All languages</option></select>
+      </div>
+    </div>
+
+    <!-- ===================== CENTER ===================== -->
+    <div id="centerArea">
+      <div id="playerWrap">
+        <video id="video" playsinline muted={false}></video>
+        <div id="playerOverlay"><div id="bufferSpin"></div></div>
+        <div id="noChannel"><div class="big">📡</div><div>No channel playing — press ENTER on a channel to start</div></div>
+        <div id="playerHint">OK×2 or F = Fullscreen</div>
+      </div>
+
+      <div id="infoBar">
+        <span class="ch-name" id="infoName">—</span>
+        <span class="badge live" id="infoLive" style="display:none;">LIVE</span>
+        <span id="infoCategory">—</span>
+        <span id="infoCountry">—</span>
+        <span id="infoRes">Res: —</span>
+        <span id="infoBuffer">Buffer: 0%</span>
+        <span id="infoVol">Vol: 100%</span>
+      </div>
+
+      <div id="categoryBar" class="hidden"></div>
+      <div id="categoryGrid" class="hidden"></div>
+
+      <div id="listHeader">
+        <span><span class="count" id="listCount">0</span> channels — <span id="listTitle">All Categories</span></span>
+        <button id="refreshBtn" tabindex="-1">⟳ Refresh Playlist</button>
+      </div>
+
+      <div id="listViewport">
+        <div id="listSpacerTop"></div>
+        <div id="listInner"></div>
+        <div id="listSpacerBottom"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===================== SETTINGS ===================== -->
+  <div id="settingsPanel">
+    <div class="settings-box" id="settingsBox">
+      <h2>⚙️ Settings</h2>
+      <div class="set-row" data-set="theme" tabindex="-1"><span class="label">Theme</span><span class="val" id="v-theme">Dark</span></div>
+      <div class="set-row" data-set="fit" tabindex="-1"><span class="label">Video Fit</span><span class="val" id="v-fit">Contain</span></div>
+      <div class="set-row" data-set="autoplay" tabindex="-1"><span class="label">Auto Play</span><span class="val" id="v-autoplay">On</span></div>
+      <div class="set-row" data-set="autofs" tabindex="-1"><span class="label">Auto Fullscreen (after 10s)</span><span class="val" id="v-autofs">On</span></div>
+      <div class="set-row" data-set="buffer" tabindex="-1"><span class="label">Buffer Time (sec)</span><span class="val" id="v-buffer">3</span></div>
+      <div class="set-row" data-set="clearcache" tabindex="-1"><span class="label">Clear Cache</span><span class="val action">Clear ›</span></div>
+      <div class="set-row" data-set="export" tabindex="-1"><span class="label">Export Favourites</span><span class="val action">Export ›</span></div>
+      <div class="set-row" data-set="import" tabindex="-1"><span class="label">Import Favourites</span><span class="val action">Import ›</span></div>
+      <div class="set-row" data-set="close" tabindex="-1"><span class="label">Close Settings</span><span class="val">BACK</span></div>
+      <input type="file" id="importFile" accept="application/json" style="display:none;">
+    </div>
+  </div>
+
+  <div id="toast"></div>
+
+  <div id="loadingScreen">
+    <div class="logo">📺 LOADING PLAYLIST</div>
+    <div class="bar-track"><div class="bar-fill" id="loadBar"></div></div>
+    <div class="status" id="loadStatus">Connecting…</div>
+  </div>
+
+</div>
+
+<script>
+"use strict";
+/* ============================================================================
+   STATE
+   ============================================================================ */
+const LS_KEYS = {
+  playlist: "iptv_playlist_cache_v1",
+  favorites: "iptv_favorites_v1",
+  recent: "iptv_recent_v1",
+  lastChannel: "iptv_last_channel_v1",
+  lastCategory: "iptv_last_category_v1",
+  volume: "iptv_volume_v1",
+  settings: "iptv_settings_v1",
+  position: "iptv_position_v1"
+};
+
+const DEFAULT_SETTINGS = {
+  theme: "dark",
+  fit: "contain",
+  autoplay: true,
+  autoFullscreen: true,
+  bufferTime: 3
+};
+
+let state = {
+  channels: [],            // full parsed list {id,name,logo,group,country,lang,url}
+  filtered: [],            // currently displayed list (after nav/search/filter)
+  categories: [],          // unique group-titles
+  favorites: [],           // array of channel urls (string ids)
+  recent: [],              // array of channel urls, most recent first, max 100
+  currentNav: "categories", // categories | favorites | recent | search | category:<name>
+  currentCategory: null,
+  currentChannel: null,    // channel object currently loaded
+  settings: Object.assign({}, DEFAULT_SETTINGS),
+  focusZone: "list",       // nav | list | search | settings
+  focusIndex: 0,           // index within focused zone
+  navIndex: 0,
+  hls: null,
+  retryCount: 0,
+  lastOkTapTime: 0,
+  fsTimer: null,
+  cursorTimer: null
+};
+
+/* ============================================================================
+   DOM SHORTCUTS
+   ============================================================================ */
+const $ = (sel) => document.querySelector(sel);
+const $$ = (sel) => Array.from(document.querySelectorAll(sel));
+const video = $("#video");
+const listInner = $("#listInner");
+const listViewport = $("#listViewport");
+const toastEl = $("#toast");
+
+/* ============================================================================
+   UTIL
+   ============================================================================ */
+function toast(msg, ms=2200){
+  toastEl.textContent = msg;
+  toastEl.classList.add("show");
+  clearTimeout(toastEl._t);
+  toastEl._t = setTimeout(()=> toastEl.classList.remove("show"), ms);
+}
+function safeParseJSON(s, fallback){
+  try{ return JSON.parse(s); }catch(e){ return fallback; }
+}
+function saveLS(key, val){
+  try{ localStorage.setItem(key, JSON.stringify(val)); }catch(e){ console.warn("LS save failed", e); }
+}
+function loadLS(key, fallback){
+  const raw = localStorage.getItem(key);
+  if(raw===null) return fallback;
+  return safeParseJSON(raw, fallback);
+}
+function channelKey(ch){ return ch.url; }
+function escapeHtml(s){
+  return (s||"").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+
+/* ============================================================================
+   M3U PARSING
+   Parses lines of:
+     #EXTM3U
+     #EXTINF:-1 tvg-id="..." tvg-logo="..." tvg-name="..." group-title="...",Channel Name
+     http://stream/url.m3u8
+   Also tolerates trailing attributes like tvg-country, tvg-language.
+   ============================================================================ */
+function parseM3U(text){
+  const lines = text.split(/\r?\n/);
+  const out = [];
+  let pending = null;
+  for(let i=0;i<lines.length;i++){
+    const line = lines[i].trim();
+    if(!line) continue;
+    if(line.startsWith("#EXTINF")){
+      const attrs = {};
+      const attrRegex = /([a-zA-Z0-9\-]+)="([^"]*)"/g;
+      let m;
+      while((m = attrRegex.exec(line)) !== null){
+        attrs[m[1].toLowerCase()] = m[2];
+      }
+      const commaIdx = line.lastIndexOf(",");
+      const displayName = commaIdx !== -1 ? line.slice(commaIdx+1).trim() : "Unnamed Channel";
+      pending = {
+        id: attrs["tvg-id"] || "",
+        logo: attrs["tvg-logo"] || "",
+        name: attrs["tvg-name"] || displayName || "Unnamed Channel",
+        group: attrs["group-title"] || "Uncategorized",
+        country: attrs["tvg-country"] || attrs["tvg-language"] ? (attrs["tvg-country"]||"") : "",
+        lang: attrs["tvg-language"] || "",
+      };
+      if(!pending.name) pending.name = displayName;
+    } else if(line.startsWith("#")){
+      // ignore other directives (#EXTVLCOPT, #EXTGRP, #KODIPROP etc.)
+      continue;
+    } else {
+      // stream URL line
+      if(pending){
+        pending.url = line;
+        pending.displayName = pending.name || "Unnamed";
+        out.push(pending);
+        pending = null;
+      }
+    }
+  }
+  return out;
+}
+
+/* ============================================================================
+   PLAYLIST LOADING
+   ============================================================================ */
+const PLAYLIST_URL = "https://iptv-org.github.io/iptv/index.m3u";
+
+/* ----------------------------------------------------------------------
+   FIXED CATEGORY SET (exactly 9)
+   Every channel in the playlist gets classified into exactly one of
+   these, based on keyword matches against its group-title / name.
+   Order matters: first matching category wins. Anything that matches
+   nothing falls into "Lifestyle / Entertainment" as the catch-all, so
+   the total is always exactly these 9 — no "Uncategorized" 10th bucket.
+   ---------------------------------------------------------------------- */
+const CATEGORIES = [
+  { key:"movies",      label:"Movies",                    icon:"🎬",
+    kw:["movie","cinema","film","vod","box office"] },
+  { key:"series",      label:"Series / TV Shows",          icon:"🎞️",
+    kw:["series","tv show","drama","soap","serial","sitcom"] },
+  { key:"sports",      label:"Sports",                     icon:"🏆",
+    kw:["sport","football","soccer","cricket","nba","nfl","tennis","golf","boxing","mma","ufc","racing","motogp","f1","rugby","basketball","baseball","hockey"] },
+  { key:"news",        label:"News",                       icon:"📰",
+    kw:["news","24 news","tv24","cnn","channel news","press","current affairs"] },
+  { key:"kids",        label:"Kids / Cartoons",            icon:"🧸",
+    kw:["kids","cartoon","anime","children","junior","disney","nickelodeon","toon"] },
+  { key:"music",       label:"Music / Concerts",           icon:"🎵",
+    kw:["music","mtv","concert","radio","hits","fm ","vevo","song"] },
+  { key:"documentary", label:"Documentaries",              icon:"🌍",
+    kw:["documentary","discovery","history","nat geo","national geographic","wildlife","science","biography","nature"] },
+  { key:"lifestyle",   label:"Lifestyle / Entertainment",  icon:"✨",
+    kw:["lifestyle","entertainment","fashion","food","cooking","travel","comedy","reality","general","variety"] },
+  { key:"religion",    label:"Religion",                   icon:"🕊️",
+    kw:["religio","islam","christian","catholic","church","gospel","quran","bible","spiritual","hindu","buddhis"] },
+];
+const CATEGORY_KEYS = CATEGORIES.map(c => c.key);
+const DEFAULT_CATEGORY = "lifestyle"; // catch-all so every channel lands in exactly one of the 9
+
+function classifyChannel(ch){
+  const hay = ((ch.group||"") + " " + (ch.name||"")).toLowerCase();
+  for(const cat of CATEGORIES){
+    if(cat.kw.some(k => hay.includes(k))) return cat.key;
+  }
+  return DEFAULT_CATEGORY;
+}
+
+function setLoadingUI(pct, statusText, mode){
+  const bar = $("#loadBar");
+  const status = $("#loadStatus");
+  bar.style.width = Math.max(0,Math.min(100,pct)) + "%";
+  status.textContent = statusText;
+  const screen = $("#loadingScreen");
+  screen.classList.remove("green","red");
+  if(mode) screen.classList.add(mode);
+}
+
+async function loadPlaylist(forceRefresh){
+  const cache = !forceRefresh ? loadLS(LS_KEYS.playlist, null) : null;
+  if(cache && Array.isArray(cache.channels) && cache.channels.length){
+    state.channels = cache.channels;
+    setLoadingUI(100, "Loaded from cache (" + cache.channels.length + " channels)", "green");
+    finishPlaylistLoad();
+    return;
+  }
+  setLoadingUI(10, "Downloading playlist…", "green");
+  try{
+    const resp = await fetch(PLAYLIST_URL, {cache:"no-store"});
+    if(!resp.ok) throw new Error("HTTP " + resp.status);
+    setLoadingUI(45, "Parsing channels…", "green");
+    const text = await resp.text();
+    const parsed = parseM3U(text);
+    if(!parsed.length) throw new Error("Empty playlist");
+    state.channels = parsed;
+    saveLS(LS_KEYS.playlist, {channels: parsed, savedAt: Date.now()});
+    setLoadingUI(100, "Loaded " + parsed.length + " channels", "green");
+    finishPlaylistLoad();
+  }catch(err){
+    console.error(err);
+    setLoadingUI(100, "Failed to load playlist: " + err.message, "red");
+    showPlaylistError();
+  }
+}
+
+function showPlaylistError(){
+  const screen = $("#loadingScreen");
+  const status = $("#loadStatus");
+  status.innerHTML = "";
+  const btn = document.createElement("div");
+  btn.className = "retry-btn focused";
+  btn.textContent = "⟳ Retry Loading Playlist";
+  btn.tabIndex = -1;
+  btn.onclick = () => { loadPlaylist(true); };
+  status.appendChild(btn);
+  // Allow OK/ENTER on remote to trigger retry while this screen is up
+  state.errorRetryEl = btn;
+}
+
+function finishPlaylistLoad(){
+  buildCategories();
+  populateFilters();
+  setTimeout(()=>{ $("#loadingScreen").style.display = "none"; }, 350);
+  restoreLastSession();
+}
+
+function buildCategories(){
+  const counts = {};
+  CATEGORY_KEYS.forEach(k => counts[k] = 0);
+  state.channels.forEach(c => {
+    c.category = classifyChannel(c);
+    counts[c.category]++;
+  });
+  state.categoryCounts = counts;
+  state.categories = CATEGORY_KEYS.slice();
+}
+
+function populateFilters(){
+  const countries = new Set(), langs = new Set();
+  state.channels.forEach(c=>{
+    if(c.country) countries.add(c.country);
+    if(c.lang) langs.add(c.lang);
+  });
+  const cSel = $("#countryFilter"), lSel = $("#langFilter");
+  Array.from(countries).sort().forEach(c=>{
+    const o = document.createElement("option"); o.value=c; o.textContent=c; cSel.appendChild(o);
+  });
+  Array.from(langs).sort().forEach(l=>{
+    const o = document.createElement("option"); o.value=l; o.textContent=l; lSel.appendChild(o);
+  });
+}
+
+/* ============================================================================
+   FAVORITES / RECENT
+   ============================================================================ */
+function isFavorite(ch){ return state.favorites.includes(channelKey(ch)); }
+function toggleFavorite(ch){
+  const key = channelKey(ch);
+  const idx = state.favorites.indexOf(key);
+  if(idx === -1){ state.favorites.push(key); toast("★ Added to Favourites"); }
+  else { state.favorites.splice(idx,1); toast("Removed from Favourites"); }
+  saveLS(LS_KEYS.favorites, state.favorites);
+  renderList();
+}
+function pushRecent(ch){
+  const key = channelKey(ch);
+  state.recent = state.recent.filter(k => k !== key);
+  state.recent.unshift(key);
+  if(state.recent.length > 100) state.recent = state.recent.slice(0,100);
+  saveLS(LS_KEYS.recent, state.recent);
+}
+function findChannelByKey(key){
+  return state.channels.find(c => channelKey(c) === key);
+}
+
+/* ============================================================================
+   FILTERING / LIST BUILDING
+   ============================================================================ */
+function getBaseListForNav(){
+  let base;
+  if(state.currentNav === "favorites"){
+    base = state.favorites.map(findChannelByKey).filter(Boolean);
+  } else if(state.currentNav === "recent"){
+    base = state.recent.map(findChannelByKey).filter(Boolean);
+  } else if(state.currentNav && state.currentNav.startsWith("category:")){
+    const catKey = state.currentNav.slice(9);
+    base = state.channels.filter(c => c.category === catKey);
+  } else {
+    base = state.channels;
+  }
+  return base;
+}
+
+function applyFilters(list){
+  const country = $("#countryFilter").value;
+  const lang = $("#langFilter").value;
+  const q = $("#searchInput").value.trim().toLowerCase();
+  let out = list;
+  if(country) out = out.filter(c => c.country === country);
+  if(lang) out = out.filter(c => c.lang === lang);
+  if(q){
+    out = out.filter(c =>
+      (c.name||"").toLowerCase().includes(q) ||
+      (c.group||"").toLowerCase().includes(q) ||
+      (c.country||"").toLowerCase().includes(q) ||
+      (c.lang||"").toLowerCase().includes(q)
+    );
+  }
+  return out;
+}
+
+function refreshFilteredList(){
+  if(state.currentNav === "categories"){
+    state.filtered = [];
+    renderList();
+    return;
+  }
+  const base = getBaseListForNav();
+  state.filtered = applyFilters(base);
+  state.focusIndex = Math.min(state.focusIndex, Math.max(0, state.filtered.length-1));
+  renderList();
+}
+
+/* ============================================================================
+   VIRTUAL SCROLL LIST RENDERING
+   Simple virtualization: fixed row height, render only visible window + buffer.
+   ============================================================================ */
+const ROW_HEIGHT = 68; // px, approx incl margin
+
+function categoryLabel(key){
+  const c = CATEGORIES.find(x => x.key === key);
+  return c ? c.label : key;
+}
+
+/* Decide which of the three center views is active and show/hide the
+   right containers: catgrid (9-category picker), catlist (category bar
+   on top + channel list), or plain list (favorites/recent/search). */
+function updateCenterViewMode(){
+  const grid = $("#categoryGrid"), bar = $("#categoryBar"), header = $("#listHeader"), viewport = $("#listViewport");
+  const inCategoriesRoot = state.currentNav === "categories";
+  const inCategoryList = state.currentNav.startsWith("category:");
+
+  grid.classList.toggle("hidden", !inCategoriesRoot);
+  bar.classList.toggle("hidden", !inCategoryList);
+  header.classList.toggle("hidden", inCategoriesRoot);
+  viewport.classList.toggle("hidden", inCategoriesRoot);
+
+  if(inCategoriesRoot) renderCategoryGrid();
+  if(inCategoryList) renderCategoryBar();
+}
+
+function renderCategoryGrid(){
+  const grid = $("#categoryGrid");
+  grid.innerHTML = CATEGORIES.map((c,i) => `
+    <div class="cat-card${state.focusZone==='catgrid' && state.catFocusIndex===i ? ' focused':''}" data-cat-idx="${i}" tabindex="-1">
+      <div class="icon">${c.icon}</div>
+      <div class="label">${escapeHtml(c.label)}</div>
+      <div class="count">${state.categoryCounts && state.categoryCounts[c.key] || 0} channels</div>
+    </div>`).join("");
+  grid.querySelectorAll(".cat-card").forEach(el=>{
+    const idx = parseInt(el.dataset.catIdx,10);
+    el.addEventListener("click", ()=>{ state.catFocusIndex = idx; selectCategory(CATEGORIES[idx].key); });
+  });
+}
+
+function renderCategoryBar(){
+  const bar = $("#categoryBar");
+  const selectedKey = state.currentNav.slice(9);
+  bar.innerHTML = CATEGORIES.map((c,i) => `
+    <div class="cat-chip${c.key===selectedKey?' selected':''}${state.focusZone==='catbar' && state.catBarIndex===i ? ' focused':''}" data-cat-idx="${i}" tabindex="-1">
+      <span>${c.icon}</span><span>${escapeHtml(c.label)}</span><span class="n">${state.categoryCounts && state.categoryCounts[c.key] || 0}</span>
+    </div>`).join("");
+  bar.querySelectorAll(".cat-chip").forEach(el=>{
+    const idx = parseInt(el.dataset.catIdx,10);
+    el.addEventListener("click", ()=>{ state.catBarIndex = idx; selectCategory(CATEGORIES[idx].key); });
+  });
+}
+
+function selectCategory(key){
+  state.currentNav = "category:" + key;
+  state.focusIndex = 0;
+  saveLS(LS_KEYS.lastCategory, state.currentNav);
+  setFocusZone("list");
+  refreshFilteredList();
+}
+
+function renderList(){
+  updateCenterViewMode();
+  const total = state.filtered.length;
+  $("#listCount").textContent = total;
+  let title = "All Categories";
+  if(state.currentNav === "favorites") title = "Favourites";
+  else if(state.currentNav === "recent") title = "Recently Played";
+  else if(state.currentNav === "search") title = "Search Results";
+  else if(state.currentNav.startsWith("category:")) title = categoryLabel(state.currentNav.slice(9));
+  $("#listTitle").textContent = title;
+
+  if(state.currentNav === "categories") return; // grid view handles itself
+
+  if(total === 0){
+    $("#listSpacerTop").style.height = "0px";
+    $("#listSpacerBottom").style.height = "0px";
+    listInner.innerHTML = `<div class="empty-state">No channels found here.<br>Try a different category or clear filters.</div>`;
+    return;
+  }
+
+  const viewportH = listViewport.clientHeight || 600;
+  const scrollTop = listViewport.scrollTop;
+  const buffer = 6;
+  const startIdx = Math.max(0, Math.floor(scrollTop / ROW_HEIGHT) - buffer);
+  const visibleCount = Math.ceil(viewportH / ROW_HEIGHT) + buffer*2;
+  const endIdx = Math.min(total, startIdx + visibleCount);
+
+  $("#listSpacerTop").style.height = (startIdx * ROW_HEIGHT) + "px";
+  $("#listSpacerBottom").style.height = ((total - endIdx) * ROW_HEIGHT) + "px";
+
+  let html = "";
+  for(let i=startIdx;i<endIdx;i++){
+    const ch = state.filtered[i];
+    const fav = isFavorite(ch);
+    const playing = state.currentChannel && channelKey(state.currentChannel) === channelKey(ch);
+    const focused = state.focusZone === "list" && state.focusIndex === i;
+    html += `<div class="chan-card${focused?' focused':''}${playing?' playing':''}" data-idx="${i}" tabindex="-1">
+      <div class="logo">${ch.logo ? `<img src="${escapeHtml(ch.logo)}" loading="lazy" onerror="this.parentNode.textContent='📺'">` : "📺"}</div>
+      <div class="meta">
+        <div class="name">${escapeHtml(ch.name)}</div>
+        <div class="sub">${escapeHtml(ch.group||"")}${ch.country? " • "+escapeHtml(ch.country):""}${ch.lang? " • "+escapeHtml(ch.lang):""}</div>
+      </div>
+      ${playing? '<span class="live-tag">▶ NOW</span>':''}
+      <div class="star ${fav?'on':''}" data-star-idx="${i}">${fav? "★" : "☆"}</div>
+    </div>`;
+  }
+  listInner.innerHTML = html;
+
+  // click handlers
+  listInner.querySelectorAll(".chan-card").forEach(el=>{
+    const idx = parseInt(el.dataset.idx,10);
+    el.addEventListener("click", (e)=>{
+      if(e.target.classList.contains("star")){
+        toggleFavorite(state.filtered[idx]);
+        return;
+      }
+      state.focusZone = "list";
+      state.focusIndex = idx;
+      playChannel(state.filtered[idx]);
+    });
+  });
+
+  // keep focused row scrolled into view
+  if(state.focusZone === "list"){
+    const targetTop = state.focusIndex * ROW_HEIGHT;
+    if(targetTop < scrollTop) listViewport.scrollTop = targetTop;
+    else if(targetTop + ROW_HEIGHT > scrollTop + viewportH) listViewport.scrollTop = targetTop + ROW_HEIGHT - viewportH;
+  }
+}
+listViewport.addEventListener("scroll", ()=> renderList());
+window.addEventListener("resize", ()=> renderList());
+
+/* ============================================================================
+   VIDEO PLAYBACK (HLS via hls.js, native fallback for MP4/DASH-ish progressive)
+   ============================================================================ */
+function destroyHls(){
+  if(state.hls){
+    try{ state.hls.destroy(); }catch(e){}
+    state.hls = null;
+  }
+}
+
+function setBuffering(on){
+  $("#bufferSpin").style.display = on ? "block" : "none";
+}
+
+function updateInfoBar(ch){
+  $("#infoName").textContent = ch ? ch.name : "—";
+  $("#infoLive").style.display = ch ? "inline-block" : "none";
+  $("#infoCategory").textContent = ch ? (ch.group || "—") : "—";
+  $("#infoCountry").textContent = ch ? (ch.country || ch.lang || "—") : "—";
+  $("#noChannel").style.display = ch ? "none" : "flex";
+}
+
+function playChannel(ch){
+  if(!ch || !ch.url) return;
+  state.currentChannel = ch;
+  state.retryCount = 0;
+  updateInfoBar(ch);
+  saveLS(LS_KEYS.lastChannel, channelKey(ch));
+  pushRecent(ch);
+  destroyHls();
+  setBuffering(true);
+
+  const url = ch.url;
+  const isHls = /\.m3u8($|\?)/i.test(url) || url.includes("m3u8");
+
+  if(isHls && window.Hls && window.Hls.isSupported()){
+    const hls = new Hls({
+      maxBufferLength: state.settings.bufferTime + 27,
+      backBufferLength: 30,
+      liveSyncDurationCount: 3,
+      enableWorker: true
+    });
+    state.hls = hls;
+    hls.loadSource(url);
+    hls.attachMedia(video);
+    hls.on(Hls.Events.MANIFEST_PARSED, ()=>{
+      setBuffering(false);
+      if(state.settings.autoplay) video.play().catch(()=>{});
+      updateResolution();
+    });
+    hls.on(Hls.Events.ERROR, (evt, data)=>{
+      if(data.fatal){
+        handleStreamFailure();
+      }
+    });
+  } else if(video.canPlayType("application/vnd.apple.mpegurl") && isHls){
+    // Safari native HLS fallback
+    video.src = url;
+    video.addEventListener("loadedmetadata", ()=>{ setBuffering(false); updateResolution(); }, {once:true});
+    video.play().catch(()=>{});
+  } else {
+    // Progressive MP4 / other direct stream
+    video.src = url;
+    video.addEventListener("loadedmetadata", ()=>{ setBuffering(false); updateResolution(); }, {once:true});
+    if(state.settings.autoplay) video.play().catch(()=>{});
+  }
+
+  video.onerror = handleStreamFailure;
+  renderList();
+}
+
+function updateResolution(){
+  if(video.videoWidth && video.videoHeight){
+    $("#infoRes").textContent = `Res: ${video.videoWidth}x${video.videoHeight}`;
+  } else {
+    $("#infoRes").textContent = "Res: —";
+  }
+}
+
+function handleStreamFailure(){
+  setBuffering(false);
+  if(state.retryCount < 1){
+    state.retryCount++;
+    toast("Stream failed — retrying…");
+    setTimeout(()=>{ if(state.currentChannel) playChannel(state.currentChannel); }, 1200);
+  } else {
+    toast("Stream unavailable — playing next favourite");
+    playNextFavorite();
+  }
+}
+
+function playNextFavorite(){
+  const favs = state.favorites.map(findChannelByKey).filter(Boolean);
+  if(!favs.length) return;
+  const curKey = state.currentChannel ? channelKey(state.currentChannel) : null;
+  let idx = favs.findIndex(f => channelKey(f) === curKey);
+  idx = (idx + 1) % favs.length;
+  playChannel(favs[idx]);
+}
+
+video.addEventListener("waiting", ()=> setBuffering(true));
+video.addEventListener("playing", ()=> setBuffering(false));
+video.addEventListener("progress", ()=>{
+  try{
+    if(video.buffered.length){
+      const end = video.buffered.end(video.buffered.length-1);
+      const dur = video.duration || end;
+      const pct = dur ? Math.min(100, Math.round((end/dur)*100)) : 0;
+      $("#infoBuffer").textContent = "Buffer: " + (isFinite(pct)?pct:0) + "%";
+    }
+  }catch(e){}
+});
+video.addEventListener("timeupdate", ()=>{
+  if(state.currentChannel){
+    saveLS(LS_KEYS.position, {key: channelKey(state.currentChannel), t: video.currentTime});
+  }
+});
+video.addEventListener("volumechange", ()=>{
+  saveLS(LS_KEYS.volume, video.volume);
+  $("#infoVol").textContent = "Vol: " + Math.round(video.volume*100) + "%";
+});
+
+/* ============================================================================
+   FULLSCREEN
+   ============================================================================ */
+function enterFullscreen(){
+  const el = $("#playerWrap");
+  const req = el.requestFullscreen || el.webkitRequestFullscreen || el.mozRequestFullScreen;
+  if(req) req.call(el).catch(()=>{});
+}
+function exitFullscreen(){
+  const ex = document.exitFullscreen || document.webkitExitFullscreen || document.mozCancelFullScreen;
+  if(ex && (document.fullscreenElement || document.webkitFullscreenElement)) ex.call(document).catch(()=>{});
+}
+function toggleFullscreen(){
+  if(document.fullscreenElement || document.webkitFullscreenElement) exitFullscreen();
+  else enterFullscreen();
+}
+function armAutoFullscreenTimer(){
+  clearTimeout(state.fsTimer);
+  if(!state.settings.autoFullscreen) return;
+  state.fsTimer = setTimeout(()=>{
+    if(!document.fullscreenElement) enterFullscreen();
+  }, 10000);
+}
+video.addEventListener("playing", armAutoFullscreenTimer);
+
+/* ============================================================================
+   NAVIGATION MODEL (D-PAD)
+   Zones: nav (left panel) -> list (channel list) -> settings (overlay)
+   focusZone: 'nav' | 'list' | 'settings' | 'search'
+   ============================================================================ */
+const navItems = () => $$(".nav-item");
+const settingsRows = () => $$(".set-row");
+
+function clearAllFocusClasses(){
+  $$(".focused").forEach(el => el.classList.remove("focused"));
+}
+
+function renderNavFocus(){
+  navItems().forEach((el,i)=> el.classList.toggle("focused", state.focusZone==="nav" && state.navIndex===i));
+  $("#refreshBtn").classList.toggle("focused", state.focusZone==="refresh");
+  $("#searchBox").classList.toggle("focused", state.focusZone==="search");
+}
+
+function setFocusZone(zone){
+  state.focusZone = zone;
+  renderNavFocus();
+  renderList();
+}
+
+function activateNavItem(idx){
+  const items = ["categories","favorites","recent","search","settings"];
+  const key = items[idx];
+  state.navIndex = idx;
+  if(key === "settings"){
+    openSettings();
+    return;
+  }
+  if(key === "search"){
+    setFocusZone("search");
+    $("#searchInput").focus();
+    return;
+  }
+  if(key === "categories"){
+    state.currentNav = "categories";
+    state.catFocusIndex = state.catFocusIndex || 0;
+    setFocusZone("catgrid");
+    updateCenterViewMode();
+    return;
+  }
+  state.currentNav = key;
+  state.focusIndex = 0;
+  setFocusZone("list");
+  refreshFilteredList();
+}
+
+/* ============================================================================
+   SETTINGS PANEL
+   ============================================================================ */
+function openSettings(){
+  $("#settingsPanel").classList.add("show");
+  state.focusZone = "settings";
+  state.settingsIndex = 0;
+  renderSettingsFocus();
+}
+function closeSettings(){
+  $("#settingsPanel").classList.remove("show");
+  setFocusZone("nav");
+}
+function renderSettingsFocus(){
+  settingsRows().forEach((el,i)=> el.classList.toggle("focused", i===state.settingsIndex));
+}
+function refreshSettingsLabels(){
+  $("#v-theme").textContent = "Dark";
+  $("#v-fit").textContent = state.settings.fit === "cover" ? "Cover" : "Contain";
+  video.style.objectFit = state.settings.fit;
+  $("#v-autoplay").textContent = state.settings.autoplay ? "On" : "Off";
+  $("#v-autofs").textContent = state.settings.autoFullscreen ? "On" : "Off";
+  $("#v-buffer").textContent = state.settings.bufferTime;
+}
+function activateSettingsRow(idx){
+  const row = settingsRows()[idx];
+  const key = row.dataset.set;
+  switch(key){
+    case "theme": break; // dark only, reserved for future themes
+    case "fit":
+      state.settings.fit = state.settings.fit === "contain" ? "cover" : "contain";
+      break;
+    case "autoplay":
+      state.settings.autoplay = !state.settings.autoplay;
+      break;
+    case "autofs":
+      state.settings.autoFullscreen = !state.settings.autoFullscreen;
+      break;
+    case "buffer":
+      state.settings.bufferTime = state.settings.bufferTime >= 10 ? 1 : state.settings.bufferTime + 1;
+      break;
+    case "clearcache":
+      localStorage.removeItem(LS_KEYS.playlist);
+      toast("Playlist cache cleared. Restart to redownload.");
+      break;
+    case "export":
+      exportFavorites();
+      break;
+    case "import":
+      $("#importFile").click();
+      break;
+    case "close":
+      closeSettings();
+      return;
+  }
+  saveLS(LS_KEYS.settings, state.settings);
+  refreshSettingsLabels();
+}
+function exportFavorites(){
+  const data = JSON.stringify({favorites: state.favorites}, null, 2);
+  const blob = new Blob([data], {type:"application/json"});
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "iptv_favorites.json";
+  a.click();
+  toast("Favourites exported");
+}
+$("#importFile").addEventListener("change", (e)=>{
+  const file = e.target.files[0];
+  if(!file) return;
+  const reader = new FileReader();
+  reader.onload = () => {
+    const data = safeParseJSON(reader.result, null);
+    if(data && Array.isArray(data.favorites)){
+      state.favorites = Array.from(new Set([...state.favorites, ...data.favorites]));
+      saveLS(LS_KEYS.favorites, state.favorites);
+      toast("Favourites imported (" + data.favorites.length + ")");
+      refreshFilteredList();
+    } else {
+      toast("Invalid favourites file");
+    }
+  };
+  reader.readAsText(file);
+});
+
+/* ============================================================================
+   REMOTE CONTROL / KEYBOARD HANDLING
+   D-PAD UP/DOWN/LEFT/RIGHT, CENTER(OK/ENTER), BACK, MENU
+   Double-click OK => fullscreen. Long-press OK => also fullscreen toggle helper.
+   ============================================================================ */
+let okPressTimer = null;
+let okPressStart = 0;
+let lastOkClickTime = 0;
+const LONG_PRESS_MS = 650;
+const DOUBLE_CLICK_MS = 380;
+
+function onOkDown(){
+  okPressStart = Date.now();
+  clearTimeout(okPressTimer);
+  okPressTimer = setTimeout(()=>{
+    // long press => toggle fullscreen
+    toggleFullscreen();
+  }, LONG_PRESS_MS);
+}
+function onOkUp(){
+  const held = Date.now() - okPressStart;
+  clearTimeout(okPressTimer);
+  if(held >= LONG_PRESS_MS) return; // already handled as long-press
+  const now = Date.now();
+  if(now - lastOkClickTime < DOUBLE_CLICK_MS){
+    toggleFullscreen();
+    lastOkClickTime = 0;
+    return;
+  }
+  lastOkClickTime = now;
+  setTimeout(()=>{
+    if(Date.now() - lastOkClickTime >= DOUBLE_CLICK_MS - 1){
+      handleSingleOk();
+    }
+  }, DOUBLE_CLICK_MS);
+}
+
+function handleSingleOk(){
+  if(state.focusZone === "settings"){
+    activateSettingsRow(state.settingsIndex);
+    return;
+  }
+  if(state.errorRetryEl){
+    loadPlaylist(true);
+    state.errorRetryEl = null;
+    return;
+  }
+  if(state.focusZone === "nav"){
+    activateNavItem(state.navIndex);
+    return;
+  }
+  if(state.focusZone === "catgrid"){
+    selectCategory(CATEGORIES[state.catFocusIndex || 0].key);
+    return;
+  }
+  if(state.focusZone === "catbar"){
+    selectCategory(CATEGORIES[state.catBarIndex || 0].key);
+    return;
+  }
+  if(state.focusZone === "refresh"){
+    loadPlaylist(true);
+    return;
+  }
+  if(state.focusZone === "list"){
+    const ch = state.filtered[state.focusIndex];
+    if(ch) playChannel(ch);
+    return;
+  }
+  if(state.focusZone === "search"){
+    setFocusZone("list");
+    return;
+  }
+}
+
+function handleBack(){
+  if(state.focusZone === "settings"){ closeSettings(); return; }
+  if(document.fullscreenElement || document.webkitFullscreenElement){ exitFullscreen(); return; }
+  if(state.focusZone === "search"){ setFocusZone("nav"); return; }
+  if(state.focusZone === "catbar" || (state.focusZone === "list" && state.currentNav.startsWith("category:"))){
+    state.currentNav = "categories";
+    setFocusZone("catgrid");
+    updateCenterViewMode();
+    return;
+  }
+  if(state.focusZone === "catgrid"){ setFocusZone("nav"); return; }
+  setFocusZone("nav");
+}
+
+function handleMenu(){
+  openSettings();
+}
+
+function moveNav(dir){
+  const n = navItems().length;
+  state.navIndex = ((state.navIndex + dir) % n + n) % n;
+  renderNavFocus();
+}
+function moveSettings(dir){
+  const n = settingsRows().length;
+  state.settingsIndex = ((state.settingsIndex + dir) % n + n) % n;
+  renderSettingsFocus();
+}
+function moveList(dir){
+  if(!state.filtered.length) return;
+  state.focusIndex = Math.max(0, Math.min(state.filtered.length-1, state.focusIndex + dir));
+  renderList();
+}
+
+const GRID_COLS = 3;
+function moveCatGrid(dir){
+  const n = CATEGORIES.length;
+  let idx = state.catFocusIndex || 0;
+  if(dir === "left") idx = Math.max(0, idx-1);
+  else if(dir === "right") idx = Math.min(n-1, idx+1);
+  else if(dir === "up") idx = Math.max(0, idx-GRID_COLS);
+  else if(dir === "down") idx = Math.min(n-1, idx+GRID_COLS);
+  state.catFocusIndex = idx;
+  renderCategoryGrid();
+}
+function moveCatBar(dir){
+  const n = CATEGORIES.length;
+  state.catBarIndex = ((state.catBarIndex||0) + dir % n + n) % n;
+  renderCategoryBar();
+}
+
+function handleDpad(direction){
+  showCursorTemporarily(false);
+  if(state.focusZone === "settings"){
+    if(direction === "up") moveSettings(-1);
+    else if(direction === "down") moveSettings(1);
+    else if(direction === "left" || direction === "right") { /* no-op, reserved */ }
+    return;
+  }
+  if(state.focusZone === "nav"){
+    if(direction === "up") moveNav(-1);
+    else if(direction === "down") moveNav(1);
+    else if(direction === "right") setFocusZone(state.currentNav === "categories" ? "catgrid" : "list");
+    return;
+  }
+  if(state.focusZone === "catgrid"){
+    if(direction === "left" || direction === "right" || direction === "up" || direction === "down") moveCatGrid(direction);
+    return;
+  }
+  if(state.focusZone === "catbar"){
+    if(direction === "left") moveCatBar(-1);
+    else if(direction === "right") moveCatBar(1);
+    else if(direction === "down") setFocusZone("list");
+    return;
+  }
+  if(state.focusZone === "refresh"){
+    if(direction === "down") setFocusZone("list");
+    else if(direction === "left") setFocusZone("nav");
+    return;
+  }
+  if(state.focusZone === "list"){
+    if(direction === "up"){
+      if(state.focusIndex === 0 && state.currentNav.startsWith("category:")){
+        state.catBarIndex = CATEGORIES.findIndex(c => c.key === state.currentNav.slice(9));
+        setFocusZone("catbar");
+      } else {
+        moveList(-1);
+      }
+    }
+    else if(direction === "down") moveList(1);
+    else if(direction === "left") setFocusZone("nav");
+    return;
+  }
+  if(state.focusZone === "search"){
+    if(direction === "down") { $("#searchInput").blur(); setFocusZone("list"); }
+    return;
+  }
+}
+
+/* ---- Keyboard mapping (also covers TV remotes that emit standard KeyboardEvents) ---- */
+window.addEventListener("keydown", (e)=>{
+  showCursorTemporarily(false);
+  const code = e.key;
+  switch(code){
+    case "ArrowUp": e.preventDefault(); handleDpad("up"); break;
+    case "ArrowDown": e.preventDefault(); handleDpad("down"); break;
+    case "ArrowLeft": e.preventDefault(); handleDpad("left"); break;
+    case "ArrowRight": e.preventDefault(); handleDpad("right"); break;
+    case "Enter": e.preventDefault(); onOkDown(); break;
+    case "Backspace":
+    case "GoBack":
+    case "Escape": e.preventDefault(); handleBack(); break;
+    case "ContextMenu":
+    case "m":
+    case "M": handleMenu(); break;
+    case "f":
+    case "F": toggleFullscreen(); break;
+    default: break;
+  }
+});
+window.addEventListener("keyup", (e)=>{
+  if(e.key === "Enter"){ e.preventDefault(); onOkUp(); }
+});
+
+/* Also allow mouse/touch users (development / non-remote) to click nav items */
+navItems().forEach((el,i)=>{
+  el.addEventListener("click", ()=>{ state.navIndex=i; activateNavItem(i); });
+});
+$("#refreshBtn").addEventListener("click", ()=> loadPlaylist(true));
+settingsRows().forEach((el,i)=>{
+  el.addEventListener("click", ()=>{ state.settingsIndex=i; activateSettingsRow(i); });
+});
+
+/* ============================================================================
+   SEARCH INPUT
+   ============================================================================ */
+$("#searchInput").addEventListener("input", ()=>{
+  state.currentNav = "search";
+  state.focusIndex = 0;
+  refreshFilteredList();
+});
+$("#countryFilter").addEventListener("change", refreshFilteredList);
+$("#langFilter").addEventListener("change", refreshFilteredList);
+
+/* ============================================================================
+   CURSOR AUTO-HIDE (3s)
+   ============================================================================ */
+function showCursorTemporarily(fromMouseMove){
+  document.body.classList.remove("cursor-hidden");
+  clearTimeout(state.cursorTimer);
+  state.cursorTimer = setTimeout(()=> document.body.classList.add("cursor-hidden"), 3000);
+}
+document.addEventListener("mousemove", ()=> showCursorTemporarily(true));
+showCursorTemporarily(true);
+
+/* ============================================================================
+   CLOCK + NETWORK STATUS
+   ============================================================================ */
+function tickClock(){
+  const d = new Date();
+  const hh = String(d.getHours()).padStart(2,"0");
+  const mm = String(d.getMinutes()).padStart(2,"0");
+  $("#clock").textContent = hh + ":" + mm;
+}
+setInterval(tickClock, 1000 * 15);
+tickClock();
+
+function updateNetStatus(){
+  const online = navigator.onLine;
+  $("#netDot").className = "dot " + (online ? "online" : "offline");
+  $("#netText").textContent = online ? "Online" : "Offline";
+}
+window.addEventListener("online", updateNetStatus);
+window.addEventListener("offline", updateNetStatus);
+updateNetStatus();
+
+/* ============================================================================
+   SESSION RESTORE / INIT
+   ============================================================================ */
+function restoreLastSession(){
+  state.settings = Object.assign({}, DEFAULT_SETTINGS, loadLS(LS_KEYS.settings, {}));
+  state.favorites = loadLS(LS_KEYS.favorites, []);
+  state.recent = loadLS(LS_KEYS.recent, []);
+  refreshSettingsLabels();
+
+  const vol = loadLS(LS_KEYS.volume, 1);
+  video.volume = typeof vol === "number" ? vol : 1;
+  $("#infoVol").textContent = "Vol: " + Math.round(video.volume*100) + "%";
+
+  state.currentNav = loadLS(LS_KEYS.lastCategory, "categories");
+  state.focusZone = "nav";
+  state.navIndex = 0;
+  refreshFilteredList();
+  renderNavFocus();
+
+  const lastKey = loadLS(LS_KEYS.lastChannel, null);
+  const lastFavKey = state.favorites[0];
+  const startKey = lastKey || lastFavKey;
+  if(startKey){
+    const ch = findChannelByKey(startKey);
+    if(ch){
+      playChannel(ch);
+      const pos = loadLS(LS_KEYS.position, null);
+      if(pos && pos.key === startKey){
+        video.addEventListener("loadedmetadata", function resume(){
+          try{ video.currentTime = pos.t || 0; }catch(e){}
+          video.removeEventListener("loadedmetadata", resume);
+        });
+      }
+    }
+  }
+}
+
+document.addEventListener("fullscreenchange", ()=>{
+  clearTimeout(state.fsTimer);
+});
+
+/* ---- Boot ---- */
+loadPlaylist(false);
+</script>
+</body>
+</html>
